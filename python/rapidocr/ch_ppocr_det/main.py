@@ -17,11 +17,13 @@
 import time
 from typing import Any, Dict
 
+import cv2
 import numpy as np
 
 from rapidocr.inference_engine.base import get_engine
 
 from .utils import DBPostProcess, DetPreProcess, TextDetOutput
+from ..utils.tiling import merge_tiled_boxes, slice_image
 
 _BOX_SORT_Y_THRESHOLD = 10
 
@@ -32,6 +34,11 @@ class TextDetector:
         self.limit_type = cfg.get("limit_type")
         self.mean = cfg.get("mean")
         self.std = cfg.get("std")
+        self.use_tiling = cfg.get("use_tiling", True)
+        self.tile_size = cfg.get("tile_size", 1280)
+        self.tile_overlap = cfg.get("tile_overlap", 0.15)
+        self.tile_scale = cfg.get("tile_scale", 1.0)
+        self.tile_min_side = cfg.get("tile_min_side", 2000)
         self.preprocess_op = None
 
         post_process = {
@@ -53,6 +60,62 @@ class TextDetector:
             raise ValueError("img is None")
 
         ori_img_shape = img.shape[0], img.shape[1]
+        h, w = ori_img_shape
+
+        # Sliced inference (SAHI) for large images (blueprints, big tables).
+        # The whole page at native resolution is expensive to push through the
+        # network and its small text survives better when the detector only has
+        # to look at tile-sized windows.
+        #
+        # Only for genuinely large pages: a text line crossing a tile boundary
+        # is detected as two fragments, which costs more than the extra recall
+        # gains on ordinary documents.
+        if self.use_tiling and max(h, w) >= self.tile_min_side:
+            tiles = slice_image(img, tile_size=self.tile_size, overlap=self.tile_overlap)
+            tiled_results = []
+            for tile, off_x, off_y in tiles:
+                # Small text (CAD dimensions, dense notes) is often below what
+                # the detector resolves at native scale; upscaling the tile
+                # before inference recovers it. Boxes are mapped back after.
+                if self.tile_scale != 1.0:
+                    tile = cv2.resize(
+                        tile,
+                        (int(tile.shape[1] * self.tile_scale), int(tile.shape[0] * self.tile_scale)),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                preprocess_op = self.get_preprocess()
+                prepro_img = preprocess_op(tile)
+                if prepro_img is None:
+                    tiled_results.append(([], off_x, off_y))
+                    continue
+                preds = self.session(prepro_img)
+                boxes, scores = self.postprocess_op(preds, tile.shape[:2])
+                if boxes is None or len(boxes) < 1:
+                    tiled_results.append(([], off_x, off_y))
+                    continue
+                scale_back = 1.0 / self.tile_scale
+                tile_boxes = []
+                for box, score in zip(boxes, scores):
+                    xs = box[:, 0] * scale_back
+                    ys = box[:, 1] * scale_back
+                    tile_boxes.append(
+                        (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()), float(score))
+                    )
+                tiled_results.append((tile_boxes, off_x, off_y))
+
+            merged = merge_tiled_boxes(tiled_results, iou_threshold=0.5)
+            if not merged:
+                return TextDetOutput()
+
+            boxes = np.array(
+                [[[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]] for b in merged],
+                dtype=np.float32,
+            )
+            scores = [b[4] for b in merged]
+            boxes = self.sorted_boxes(boxes)
+            elapse = time.perf_counter() - start_time
+            return TextDetOutput(img, boxes, scores, elapse=elapse)
+
         self.preprocess_op = self.get_preprocess()
         prepro_img = self.preprocess_op(img)
         if prepro_img is None:
